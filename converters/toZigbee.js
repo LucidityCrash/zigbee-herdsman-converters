@@ -7,6 +7,7 @@ const herdsman = require('zigbee-herdsman');
 const legacy = require('../lib/legacy');
 const light = require('../lib/light');
 const constants = require('../lib/constants');
+const libColor = require('../lib/color');
 
 const manufacturerOptions = {
     xiaomi: {manufacturerCode: herdsman.Zcl.ManufacturerCode.LUMI_UNITED_TECH, disableDefaultResponse: true},
@@ -194,6 +195,55 @@ const converters = {
                 }
 
                 await entity.command('closuresDoorLock', 'getPinCode', {userid: user}, utils.getOptions(meta));
+            }
+        },
+    },
+    lock_userstatus: {
+        key: ['user_status'],
+        convertSet: async (entity, key, value, meta) => {
+            const user = value.user;
+            if ( isNaN(user) ) {
+                throw new Error('user must be numbers');
+            }
+            if (!utils.isInRange(0, meta.mapped.meta.pinCodeCount - 1, user)) {
+                throw new Error('user must be in range for device');
+            }
+
+            const status = utils.getKey(constants.lockUserStatus, value.status, undefined, Number);
+
+            if (status === undefined) {
+                throw new Error(`Unsupported status: '${value.status}', should be one of: ${Object.values(constants.lockUserStatus)}`);
+            }
+
+            await entity.command(
+                'closuresDoorLock',
+                'setUserStatus',
+                {
+                    'userid': user,
+                    'userstatus': status,
+                },
+                utils.getOptions(meta.mapped),
+            );
+        },
+        convertGet: async (entity, key, meta) => {
+            const user = meta && meta.message && meta.message.user_status ? meta.message.user_status.user : undefined;
+
+            if (user === undefined) {
+                const max = meta.mapped.meta.pinCodeCount;
+                // Get all
+                const options = utils.getOptions(meta);
+                for (let i = 0; i < max; i++) {
+                    await entity.command('closuresDoorLock', 'getUserStatus', {userid: i}, options);
+                }
+            } else {
+                if (isNaN(user)) {
+                    throw new Error('user must be numbers');
+                }
+                if (!utils.isInRange(0, meta.mapped.meta.pinCodeCount - 1, user)) {
+                    throw new Error('userId must be in range for device');
+                }
+
+                await entity.command('closuresDoorLock', 'getUserStatus', {userid: user}, utils.getOptions(meta));
             }
         },
     },
@@ -503,6 +553,13 @@ const converters = {
 
             if (meta.state.hasOwnProperty('brightness')) {
                 let brightness = onOff || meta.state.state === 'ON' ? meta.state.brightness + value : meta.state.brightness;
+                if (value === 0) {
+                    const entityToRead = utils.getEntityOrFirstGroupMember(entity);
+                    if (entityToRead) {
+                        brightness = (await entityToRead.read('genLevelCtrl', ['currentLevel'])).currentLevel;
+                    }
+                }
+
                 brightness = Math.min(254, brightness);
                 brightness = Math.max(onOff || meta.state.state === 'OFF' ? 0 : 1, brightness);
 
@@ -526,9 +583,10 @@ const converters = {
 
                 // As we cannot determine the new brightness state, we read it from the device
                 await utils.sleep(500);
-                const target = entity.constructor.name === 'Group' ? entity.members[0] : entity;
-                await target.read('genOnOff', ['onOff']);
-                await target.read('genLevelCtrl', ['currentLevel']);
+                const target = utils.getEntityOrFirstGroupMember(entity);
+                const onOff = (await target.read('genOnOff', ['onOff'])).onOff;
+                const brightness = (await target.read('genLevelCtrl', ['currentLevel'])).currentLevel;
+                return {state: {brightness, state: onOff === 1 ? 'ON' : 'OFF'}};
             } else {
                 value = Number(value);
                 if (isNaN(value)) {
@@ -697,7 +755,8 @@ const converters = {
                         globalStore.putValue(entity, 'turnedOffWithTransition', true);
                     }
 
-                    let level = state === 'off' ? 0 : globalStore.getValue(entity, 'brightness', 254);
+                    const fallbackLevel = utils.getObjectProperty(meta.state, 'brightness', 254);
+                    let level = state === 'off' ? 0 : globalStore.getValue(entity, 'brightness', fallbackLevel);
                     if (state === 'on' && level === 0) level = turnsOffAtBrightness1 ? 2 : 1;
 
                     const payload = {level, transtime: transition.time};
@@ -841,234 +900,81 @@ const converters = {
     light_color: {
         key: ['color'],
         convertSet: async (entity, key, value, meta) => {
-            // Check if we need to convert from RGB to XY and which cmd to use
             let command;
+            const newColor = libColor.Color.fromConverterArg(value);
             const newState = {};
-
-
-            if (value.hasOwnProperty('r') && value.hasOwnProperty('g') && value.hasOwnProperty('b')) {
-                const xy = utils.rgbToXY(value.r, value.g, value.b);
-                value.x = xy.x;
-                value.y = xy.y;
-            } else if (value.hasOwnProperty('rgb')) {
-                const rgb = value.rgb.split(',').map((i) => parseInt(i));
-                const xy = utils.rgbToXY(rgb[0], rgb[1], rgb[2]);
-                value.x = xy.x;
-                value.y = xy.y;
-            } else if (value.hasOwnProperty('hex') || (typeof value === 'string' && value.startsWith('#'))) {
-                const xy = utils.hexToXY(typeof value === 'string' && value.startsWith('#') ? value : value.hex);
-                value = {x: xy.x, y: xy.y};
-            } else if (value.hasOwnProperty('h') && value.hasOwnProperty('s') && value.hasOwnProperty('l')) {
-                newState.color = {h: value.h, s: value.s, l: value.l};
-                const hsv = utils.gammaCorrectHSV(...Object.values(
-                    utils.hslToHSV(utils.correctHue(value.h, meta), value.s, value.l)));
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                value.brightness = utils.mapNumberRange(hsv.v, 0, 100, 0, 254);
-                newState.brightness = value.brightness;
-
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturationAndBrightness';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturationAndBrightness';
-                }
-            } else if (value.hasOwnProperty('hsl')) {
-                newState.color = {hsl: value.hsl};
-                const hsl = value.hsl.split(',').map((i) => parseInt(i));
-                const hsv = utils.gammaCorrectHSV(...Object.values(
-                    utils.hslToHSV(utils.correctHue(hsl[0], meta), hsl[1], hsl[2])));
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                value.brightness = utils.mapNumberRange(hsv.v, 0, 100, 0, 254);
-                newState.brightness = value.brightness;
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturationAndBrightness';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturationAndBrightness';
-                }
-            } else if (value.hasOwnProperty('h') && value.hasOwnProperty('s') && value.hasOwnProperty('b')) {
-                newState.color = {h: value.h, s: value.s, v: value.b};
-                const hsv = utils.gammaCorrectHSV(utils.correctHue(value.h, meta), value.s, value.b);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                value.brightness = utils.mapNumberRange(hsv.v, 0, 100, 0, 254);
-                newState.brightness = value.brightness;
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturationAndBrightness';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturationAndBrightness';
-                }
-            } else if (value.hasOwnProperty('hsb')) {
-                let hsv = value.hsb.split(',').map((i) => parseInt(i));
-                newState.color = {h: hsv[0], s: hsv[1], v: hsv[2]};
-                hsv = utils.gammaCorrectHSV(utils.correctHue(hsv[0], meta), hsv[1], hsv[2]);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                value.brightness = utils.mapNumberRange(hsv.v, 0, 100, 0, 254);
-                newState.brightness = value.brightness;
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturationAndBrightness';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturationAndBrightness';
-                }
-            } else if (value.hasOwnProperty('h') && value.hasOwnProperty('s') && value.hasOwnProperty('v')) {
-                newState.color = {h: value.h, s: value.s, v: value.v};
-                const hsv = utils.gammaCorrectHSV(utils.correctHue(value.h, meta), value.s, value.v);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                value.brightness = utils.mapNumberRange(hsv.v, 0, 100, 0, 254);
-                newState.brightness = value.brightness;
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturationAndBrightness';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturationAndBrightness';
-                }
-            } else if (value.hasOwnProperty('hsv')) {
-                let hsv = value.hsv.split(',').map((i) => parseInt(i));
-                newState.color = {h: hsv[0], s: hsv[1], v: hsv[2]};
-                hsv = utils.gammaCorrectHSV(utils.correctHue(hsv[0], meta), hsv[1], hsv[2]);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                value.brightness = utils.mapNumberRange(hsv.v, 0, 100, 0, 254);
-                newState.brightness = value.brightness;
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturationAndBrightness';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturationAndBrightness';
-                }
-            } else if (value.hasOwnProperty('h') && value.hasOwnProperty('s')) {
-                newState.color = {h: value.h, s: value.s};
-                const hsv = utils.gammaCorrectHSV(utils.correctHue(value.h, meta), value.s, 100);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturation';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturation';
-                }
-            } else if (value.hasOwnProperty('h')) {
-                newState.color = {h: value.h};
-                const hsv = utils.gammaCorrectHSV(utils.correctHue(value.h, meta), 100, 100);
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHue';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHue';
-                }
-            } else if (value.hasOwnProperty('s')) {
-                newState.color = {s: value.s};
-                const hsv = utils.gammaCorrectHSV(360, value.s, 100);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                command = 'moveToSaturation';
-            } else if (value.hasOwnProperty('hue') && value.hasOwnProperty('saturation')) {
-                newState.color = {hue: value.hue, saturation: value.saturation};
-                const hsv = utils.gammaCorrectHSV(utils.correctHue(value.hue, meta), value.saturation, 100);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHueAndSaturation';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHueAndSaturation';
-                }
-            } else if (value.hasOwnProperty('hue')) {
-                newState.color = {hue: value.hue};
-                const hsv = utils.gammaCorrectHSV(utils.correctHue(value.hue, meta), 100, 100);
-                if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                    value.hue = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                    command = 'enhancedMoveToHue';
-                } else {
-                    value.hue = utils.mapNumberRange(hsv.h, 0, 360, 0, 254);
-                    command = 'moveToHue';
-                }
-            } else if (value.hasOwnProperty('saturation')) {
-                newState.color = {saturation: value.saturation};
-                const hsv = utils.gammaCorrectHSV(360, value.saturation, 100);
-                value.saturation = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
-                command = 'moveToSaturation';
-            }
 
             const zclData = {transtime: utils.getTransition(entity, key, meta).time};
 
-            switch (command) {
-            case 'enhancedMoveToHueAndSaturationAndBrightness':
-                newState.color_mode = constants.colorMode[0];
-                await entity.command(
-                    'genLevelCtrl',
-                    'moveToLevelWithOnOff',
-                    {level: Number(value.brightness), transtime: utils.getTransition(entity, key, meta).time},
-                    utils.getOptions(meta.mapped, entity),
-                );
-                zclData.enhancehue = value.hue;
-                zclData.saturation = value.saturation;
-                zclData.direction = value.direction || 0;
-                command = 'enhancedMoveToHueAndSaturation';
-                break;
-            case 'enhancedMoveToHueAndSaturation':
-                newState.color_mode = constants.colorMode[0];
-                zclData.enhancehue = value.hue;
-                zclData.saturation = value.saturation;
-                zclData.direction = value.direction || 0;
-                break;
-            case 'enhancedMoveToHue':
-                newState.color_mode = constants.colorMode[0];
-                zclData.enhancehue = value.hue;
-                zclData.direction = value.direction || 0;
-                break;
-            case 'moveToHueAndSaturationAndBrightness':
-                newState.color_mode = constants.colorMode[0];
-                await entity.command(
-                    'genLevelCtrl',
-                    'moveToLevelWithOnOff',
-                    {level: Number(value.brightness), transtime: utils.getTransition(entity, key, meta).time},
-                    utils.getOptions(meta.mapped, entity),
-                );
-                zclData.hue = value.hue;
-                zclData.saturation = value.saturation;
-                zclData.direction = value.direction || 0;
-                command = 'moveToHueAndSaturation';
-                break;
-            case 'moveToHueAndSaturation':
-                newState.color_mode = constants.colorMode[0];
-                zclData.hue = value.hue;
-                zclData.saturation = value.saturation;
-                zclData.direction = value.direction || 0;
-                break;
-            case 'moveToHue':
-                newState.color_mode = constants.colorMode[0];
-                zclData.hue = value.hue;
-                zclData.direction = value.direction || 0;
-                break;
-            case 'moveToSaturation':
-                newState.color_mode = constants.colorMode[0];
-                zclData.saturation = value.saturation;
-                break;
-
-            default:
-                command = 'moveToColor';
+            if (newColor.isRGB() || newColor.isXY()) {
+                // Convert RGB to XY color mode because Zigbee doesn't support RGB (only x/y and hue/saturation)
+                const xy = newColor.isRGB() ? newColor.rgb.gammaCorrected().toXY().rounded(4) : newColor.xy;
 
                 // Some bulbs e.g. RB 185 C don't turn to red (they don't respond at all) when x: 0.701 and y: 0.299
                 // is send. These values are e.g. send by Home Assistant when clicking red in the color wheel.
                 // If we slighlty modify these values the bulb will respond.
                 // https://github.com/home-assistant/home-assistant/issues/31094
-                if (utils.getMetaValue(entity, meta.mapped, 'applyRedFix', 'allEqual', false) && value.x == 0.701 && value.y === 0.299) {
-                    value.x = 0.7006;
-                    value.y = 0.2993;
+                if (utils.getMetaValue(entity, meta.mapped, 'applyRedFix', 'allEqual', false) && xy.x == 0.701 && xy.y === 0.299) {
+                    xy.x = 0.7006;
+                    xy.y = 0.2993;
                 }
 
-                newState.color = {x: value.x, y: value.y};
                 newState.color_mode = constants.colorMode[1];
-                zclData.colorx = utils.mapNumberRange(value.x, 0, 1, 0, 65535);
-                zclData.colory = utils.mapNumberRange(value.y, 0, 1, 0, 65535);
+                newState.color = xy.toObject();
+                zclData.colorx = utils.mapNumberRange(xy.x, 0, 1, 0, 65535);
+                zclData.colory = utils.mapNumberRange(xy.y, 0, 1, 0, 65535);
+                command = 'moveToColor';
+            } else if (newColor.isHSV()) {
+                const enhancedHue = utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true);
+                const hsv = newColor.hsv;
+                const hsvCorrected = hsv.colorCorrected(meta);
+                newState.color_mode = constants.colorMode[0];
+                newState.color = hsv.toObject(false);
+
+                if (hsv.hue !== null) {
+                    if (enhancedHue) {
+                        zclData.enhancehue = utils.mapNumberRange(hsvCorrected.hue, 0, 360, 0, 65535);
+                    } else {
+                        zclData.hue = utils.mapNumberRange(hsvCorrected.hue, 0, 360, 0, 254);
+                    }
+                    zclData.direction = value.direction || 0;
+                }
+
+                if (hsv.saturation != null) {
+                    zclData.saturation = utils.mapNumberRange(hsvCorrected.saturation, 0, 100, 0, 254);
+                }
+
+                if (hsv.value !== null) {
+                    // fallthrough to genLevelCtrl
+                    value.brightness = utils.mapNumberRange(hsvCorrected.value, 0, 100, 0, 254);
+                }
+
+                if (hsv.hue !== null && hsv.saturation !== null) {
+                    if (enhancedHue) {
+                        command = 'enhancedMoveToHueAndSaturation';
+                    } else {
+                        command = 'moveToHueAndSaturation';
+                    }
+                } else if (hsv.hue !== null) {
+                    if (enhancedHue) {
+                        command = 'enhancedMoveToHue';
+                    } else {
+                        command = 'moveToHue';
+                    }
+                } else if (hsv.saturation !== null) {
+                    command = 'moveToSaturation';
+                }
             }
+
+            if (value.hasOwnProperty('brightness')) {
+                await entity.command(
+                    'genLevelCtrl',
+                    'moveToLevelWithOnOff',
+                    {level: Number(value.brightness), transtime: utils.getTransition(entity, key, meta).time},
+                    utils.getOptions(meta.mapped, entity),
+                );
+            }
+
             await entity.command('lightingColorCtrl', command, zclData, utils.getOptions(meta.mapped, entity));
             return {state: newState, readAfterWriteTime: zclData.transtime * 100};
         },
@@ -1125,13 +1031,13 @@ const converters = {
             if (key == 'color') {
                 const result = await converters.light_color.convertSet(entity, key, value, meta);
                 if (result.state && result.state.color.hasOwnProperty('x') && result.state.color.hasOwnProperty('y')) {
-                    result.state.color_temp = utils.xyToMireds(result.state.color.x, result.state.color.y);
+                    result.state.color_temp = Math.round(libColor.ColorXY.fromObject(result.state.color).toMireds());
                 }
 
                 return result;
             } else if (key == 'color_temp' || key == 'color_temp_percent') {
                 const result = await converters.light_colortemp.convertSet(entity, key, value, meta);
-                result.state.color = utils.miredsToXY(result.state.color_temp);
+                result.state.color = libColor.ColorXY.fromMireds(result.state.color_temp).rounded(4).toObject();
                 return result;
             }
         },
@@ -1656,13 +1562,13 @@ const converters = {
             if (key == 'color') {
                 const result = await converters.gledopto_light_color.convertSet(entity, key, value, meta);
                 if (result.state && result.state.color.hasOwnProperty('x') && result.state.color.hasOwnProperty('y')) {
-                    result.state.color_temp = utils.xyToMireds(result.state.color.x, result.state.color.y);
+                    result.state.color_temp = Math.round(libColor.ColorXY.fromObject(result.state.color).toMireds());
                 }
 
                 return result;
             } else if (key == 'color_temp' || key == 'color_temp_percent') {
                 const result = await converters.gledopto_light_colortemp.convertSet(entity, key, value, meta);
-                result.state.color = utils.miredsToXY(result.state.color_temp);
+                result.state.color = libColor.ColorXY.fromMireds(result.state.color_temp).rounded(4).toObject();
                 return result;
             }
         },
@@ -1811,10 +1717,23 @@ const converters = {
             await entity.command('closuresDoorLock', lookup[value], {'pincodevalue': ''});
         },
     },
+    xiaomi_switch_type: {
+        key: ['switch_type'],
+        convertSet: async (entity, key, value, meta) => {
+            const lookup = {'toggle': 1, 'momentary': 2};
+            value = value.toLowerCase();
+            utils.validateValue(value, Object.keys(lookup));
+            await entity.write('aqaraOpple', {0x000A: {value: lookup[value], type: 0x20}}, manufacturerOptions.xiaomi);
+            return {state: {switch_type: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read('aqaraOpple', [0x000A], manufacturerOptions.xiaomi);
+        },
+    },
     xiaomi_switch_power_outage_memory: {
         key: ['power_outage_memory'],
         convertSet: async (entity, key, value, meta) => {
-            if (['ZNCZ04LM', 'QBKG25LM'].includes(meta.mapped.model)) {
+            if (['ZNCZ04LM', 'QBKG25LM', 'SSM-U01'].includes(meta.mapped.model)) {
                 await entity.write('aqaraOpple', {0x0201: {value: value ? 1 : 0, type: 0x10}}, manufacturerOptions.xiaomi);
             } else if (['ZNCZ02LM', 'QBCZ11LM'].includes(meta.mapped.model)) {
                 const payload = value ?
@@ -1828,6 +1747,15 @@ const converters = {
             }
 
             return {state: {power_outage_memory: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            if (['ZNCZ04LM', 'QBKG25LM', 'SSM-U01'].includes(meta.mapped.model)) {
+                await entity.read('aqaraOpple', [0x0201]);
+            } else if (['ZNCZ02LM', 'QBCZ11LM'].includes(meta.mapped.model)) {
+                await entity.read('aqaraOpple', [0xFFF0]);
+            } else {
+                throw new Error('Not supported');
+            }
         },
     },
     xiaomi_light_power_outage_memory: {
@@ -1909,7 +1837,7 @@ const converters = {
     STS_PRS_251_beep: {
         key: ['beep'],
         convertSet: async (entity, key, value, meta) => {
-            await entity.command('genIdentify', 'identifyTime', {identifytime: value}, utils.getOptions(meta.mapped, entity));
+            await entity.command('genIdentify', 'identify', {identifytime: value}, utils.getOptions(meta.mapped, entity));
         },
     },
     xiaomi_curtain_options: {
@@ -2003,6 +1931,13 @@ const converters = {
                     await entity.command('manuSpecificOsram', 'resetStartupParams', {}, manufacturerOptions.osram);
                 }
             }
+        },
+    },
+    SPZ01_power_outage_memory: {
+        key: ['power_outage_memory'],
+        convertSet: async (entity, key, value, meta) => {
+            await entity.write('genOnOff', {0x2000: {value: value ? 0x01 : 0x00, type: 0x20}});
+            return {state: {power_outage_memory: value}};
         },
     },
     tuya_switch_power_outage_memory: {
@@ -2467,6 +2402,25 @@ const converters = {
             const keyid = multiEndpoint ? lookup[meta.endpoint_name] : 1;
             await tuya.sendDataPointBool(entity, keyid, value === 'ON');
             return {state: {state: value.toUpperCase()}};
+        },
+    },
+    frankever_threshold: {
+        key: ['threshold'],
+        convertSet: async (entity, key, value, meta) => {
+            // input to multiple of 10 with max value of 100
+            const thresh = Math.abs(Math.min(10*(Math.floor(value/10)), 100));
+            await tuya.sendDataPointValue(entity, tuya.dataPoints.frankEverTreshold, thresh, 'setData', 1);
+            return {state: {threshold: value}};
+        },
+    },
+    frankever_timer: {
+        key: ['timer'],
+        convertSet: async (entity, key, value, meta) => {
+            // input in minutes with maximum of 600 minutes (equals 10 hours)
+            const timer = 60 * Math.abs(Math.min(value, 600));
+            // sendTuyaDataPoint* functions take care of converting the data to proper format
+            await tuya.sendDataPointValue(entity, tuya.dataPoints.frankEverTimer, timer, 'setData', 1);
+            return {state: {timer: value}};
         },
     },
     RM01_light_onoff_brightness: {
@@ -3318,7 +3272,12 @@ const converters = {
     bticino_4027C_cover_state: {
         key: ['state'],
         convertSet: async (entity, key, value, meta) => {
-            const lookup = {'open': 'upOpen', 'close': 'downClose', 'stop': 'stop', 'on': 'upOpen', 'off': 'downClose'};
+            const invert = !(utils.getMetaValue(entity, meta.mapped, 'coverInverted', 'allEqual', false) ?
+                !meta.options.invert_cover : meta.options.invert_cover);
+            const lookup = invert ?
+                {'open': 'upOpen', 'close': 'downClose', 'stop': 'stop', 'on': 'upOpen', 'off': 'downClose'} :
+                {'open': 'downClose', 'close': 'upOpen', 'stop': 'stop', 'on': 'downClose', 'off': 'upOpen'};
+
             value = value.toLowerCase();
             utils.validateValue(value, Object.keys(lookup));
 
@@ -3335,8 +3294,17 @@ const converters = {
     bticino_4027C_cover_position: {
         key: ['position'],
         convertSet: async (entity, key, value, meta) => {
-            const position = value >= 50 ? 100 : 0;
-            await entity.command('closuresWindowCovering', 'goToLiftPercentage', {percentageliftvalue: position},
+            const invert = !(utils.getMetaValue(entity, meta.mapped, 'coverInverted', 'allEqual', false) ?
+                !meta.options.invert_cover : meta.options.invert_cover);
+            let newPosition = value;
+            if (meta.options.no_position_support) {
+                newPosition = value >= 50 ? 100 : 0;
+            }
+            const position = newPosition;
+            if (invert) {
+                newPosition = 100 - newPosition;
+            }
+            await entity.command('closuresWindowCovering', 'goToLiftPercentage', {percentageliftvalue: newPosition},
                 utils.getOptions(meta.mapped, entity));
             return {state: {['position']: position}, readAfterWriteTime: 0};
         },
@@ -4170,7 +4138,7 @@ const converters = {
                     const [colorTempMin, colorTempMax] = light.findColorTempRange(entity, meta.logger);
                     val = light.clampColorTemp(val, colorTempMin, colorTempMax, meta.logger);
 
-                    const xy = utils.miredsToXY(val);
+                    const xy = libColor.ColorXY.fromMireds(val);
                     const xScaled = utils.mapNumberRange(xy.x, 0, 1, 0, 65535);
                     const yScaled = utils.mapNumberRange(xy.y, 0, 1, 0, 65535);
                     extensionfieldsets.push({'clstId': 768, 'len': 4, 'extField': [xScaled, yScaled]});
@@ -4181,10 +4149,11 @@ const converters = {
                     } catch (e) {
                         e;
                     }
-                    const color = typeof val === 'string' ? utils.hexToXY(val) : val;
-                    if (color.hasOwnProperty('x') && color.hasOwnProperty('y')) {
-                        const xScaled = utils.mapNumberRange(color.x, 0, 1, 0, 65535);
-                        const yScaled = utils.mapNumberRange(color.y, 0, 1, 0, 65535);
+
+                    const newColor = libColor.Color.fromConverterArg(val);
+                    if (newColor.isXY()) {
+                        const xScaled = utils.mapNumberRange(newColor.xy.x, 0, 1, 0, 65535);
+                        const yScaled = utils.mapNumberRange(newColor.xy.y, 0, 1, 0, 65535);
                         extensionfieldsets.push(
                             {
                                 'clstId': 768,
@@ -4192,12 +4161,12 @@ const converters = {
                                 'extField': [xScaled, yScaled],
                             },
                         );
-                        state['color'] = {x: color.x, y: color.y};
-                    } else if (color.hasOwnProperty('hue') && color.hasOwnProperty('saturation')) {
+                        state['color'] = newColor.xy.toObject();
+                    } else if (newColor.isHSV()) {
+                        const hsvCorrected = newColor.hsv.colorCorrected(meta);
                         if (utils.getMetaValue(entity, meta.mapped, 'enhancedHue', 'allEqual', true)) {
-                            const hsv = utils.gammaCorrectHSV(utils.correctHue(color.hue, meta), color.saturation, 100);
-                            const hScaled = utils.mapNumberRange(hsv.h % 360, 0, 360, 0, 65535);
-                            const sScaled = utils.mapNumberRange(hsv.s, 0, 100, 0, 254);
+                            const hScaled = utils.mapNumberRange(hsvCorrected.hue, 0, 360, 0, 65535);
+                            const sScaled = utils.mapNumberRange(hsvCorrected.saturation, 0, 100, 0, 254);
                             extensionfieldsets.push(
                                 {
                                     'clstId': 768,
@@ -4208,8 +4177,7 @@ const converters = {
                         } else {
                             // The extensionFieldSet is always EnhancedCurrentHue according to ZCL
                             // When the bulb or all bulbs in a group do not support enhanchedHue,
-                            // a fallback to XY is done by converting HSV -> RGB -> XY
-                            const colorXY = utils.rgbToXY(...Object.values(utils.hsvToRgb(color.hue, color.saturation, 100)));
+                            const colorXY = hsvCorrected.toXY();
                             const xScaled = utils.mapNumberRange(colorXY.x, 0, 1, 0, 65535);
                             const yScaled = utils.mapNumberRange(colorXY.y, 0, 1, 0, 65535);
                             extensionfieldsets.push(
@@ -4220,7 +4188,7 @@ const converters = {
                                 },
                             );
                         }
-                        state['color'] = {hue: color.hue, saturation: color.saturation};
+                        state['color'] = newColor.hsv.toObject(true);
                     }
                 }
             }
@@ -4820,6 +4788,51 @@ const converters = {
         },
         convertGet: async (entity, key, meta) => {
             await entity.read('genOnOff', ['onOff']);
+        },
+    },
+    idlock_master_pin_mode: {
+        key: ['master_pin_mode'],
+        convertSet: async (entity, key, value, meta) => {
+            await entity.write('closuresDoorLock', {0x4000: {value: value === true ? 1 : 0, type: 0x10}},
+                {manufacturerCode: 4919});
+            return {state: {master_pin_mode: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read('closuresDoorLock', [0x4000], {manufacturerCode: 4919});
+        },
+    },
+    idlock_rfid_enable: {
+        key: ['rfid_enable'],
+        convertSet: async (entity, key, value, meta) => {
+            await entity.write('closuresDoorLock', {0x4001: {value: value === true ? 1 : 0, type: 0x10}},
+                {manufacturerCode: 4919});
+            return {state: {rfid_enable: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read('closuresDoorLock', [0x4001], {manufacturerCode: 4919});
+        },
+    },
+    idlock_lock_mode: {
+        key: ['lock_mode'],
+        convertSet: async (entity, key, value, meta) => {
+            const lookup = {'auto_off_away_off': 0, 'auto_on_away_off': 1, 'auto_off_away_on': 2, 'auto_on_away_on': 3};
+            await entity.write('closuresDoorLock', {0x4004: {value: lookup[value], type: 0x20}},
+                {manufacturerCode: 4919});
+            return {state: {lock_mode: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read('closuresDoorLock', [0x4004], {manufacturerCode: 4919});
+        },
+    },
+    idlock_relock_enabled: {
+        key: ['relock_enabled'],
+        convertSet: async (entity, key, value, meta) => {
+            await entity.write('closuresDoorLock', {0x4005: {value: value === true ? 1 : 0, type: 0x10}},
+                {manufacturerCode: 4919});
+            return {state: {relock_enabled: value}};
+        },
+        convertGet: async (entity, key, meta) => {
+            await entity.read('closuresDoorLock', [0x4005], {manufacturerCode: 4919});
         },
     },
 

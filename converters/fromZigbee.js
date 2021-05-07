@@ -2,7 +2,7 @@
 
 /**
  * Documentation of convert() parameters
- * - model: zigbee-herdsman-converters definition (form devices.js)
+ * - model: zigbee-herdsman-converters definition (form definition)
  * - msg: message data property
  * - publish: publish method
  * - options: converter options object, e.g. {occupancy_timeout: 120}
@@ -217,6 +217,11 @@ const converters = {
                 result.sound_volume = constants.lockSoundVolume[msg.data.soundVolume];
             }
 
+            if (msg.data.hasOwnProperty('doorState')) {
+                const lookup = {
+                    0: 'open', 1: 'closed', 2: 'error_jammed', 3: 'error_forced_open', 4: 'error_unspecified', 0xff: 'undefined'};
+                result.door_state = lookup[msg.data['doorState']];
+            }
             return result;
         },
     },
@@ -225,27 +230,38 @@ const converters = {
         type: ['commandGetPinCodeRsp'],
         convert: (model, msg, publish, options, meta) => {
             const {data} = msg;
-            let status = '';
-            let pinCodeValue = null;
-            switch (data.userstatus) {
-            case 0:
-                status = 'available';
-                break;
-            case 1:
-                status = 'enabled';
-                pinCodeValue = data.pincodevalue;
-                break;
-            case 2:
-                status = 'disabled';
-                break;
-            default:
-                status = 'not_supported';
+            let status = constants.lockUserStatus[data.userstatus];
+
+            if (status === undefined) {
+                status = `not_supported_${data.userstatus}`;
             }
+
             const userId = data.userid.toString();
             const result = {users: {}};
             result.users[userId] = {status: status};
-            if (options && options.expose_pin && pinCodeValue) {
-                result.users[userId].pin_code = pinCodeValue;
+            if (options && options.expose_pin && data.pincodevalue) {
+                result.users[userId].pin_code = data.pincodevalue;
+            }
+            return result;
+        },
+    },
+    lock_user_status_response: {
+        cluster: 'closuresDoorLock',
+        type: ['commandGetUserStatusRsp'],
+        convert: (model, msg, publish, options, meta) => {
+            const {data} = msg;
+
+            let status = constants.lockUserStatus[data.userstatus];
+
+            if (status === undefined) {
+                status = `not_supported_${data.userstatus}`;
+            }
+
+            const userId = data.userid.toString();
+            const result = {users: {}};
+            result.users[userId] = {status: status};
+            if (options && options.expose_pin && data.pincodevalue) {
+                result.users[userId].pin_code = data.pincodevalue;
             }
             return result;
         },
@@ -731,9 +747,7 @@ const converters = {
         type: 'commandStatusChangeNotification',
         convert: (model, msg, publish, options, meta) => {
             const zoneStatus = msg.data.zonestatus;
-            const zoneState = msg.data.zoneState;
             return {
-                enrolled: zoneState === 1,
                 smoke: (zoneStatus & 1) > 0,
                 tamper: (zoneStatus & 1<<2) > 0,
                 battery_low: (zoneStatus & 1<<3) > 0,
@@ -741,6 +755,7 @@ const converters = {
                 restore_reports: (zoneStatus & 1<<5) > 0,
                 trouble: (zoneStatus & 1<<6) > 0,
                 ac_status: (zoneStatus & 1<<7) > 0,
+                test: (zoneStatus & 1<<8) > 0,
             };
         },
     },
@@ -1266,7 +1281,7 @@ const converters = {
         type: ['attributeReport', 'readResponse'],
         convert: (model, msg, publish, options, meta) => {
             const currentLevel = Number(msg.data['currentLevel']);
-            let position = mapNumberRange(currentLevel, 0, 255, 0, 100).toString();
+            let position = mapNumberRange(currentLevel, 0, 255, 0, 100);
             position = options.invert_cover ? 100 - position : position;
             const state = options.invert_cover ? (position > 0 ? 'CLOSE' : 'OPEN') : (position > 0 ? 'OPEN' : 'CLOSE');
             return {state: state, position: position};
@@ -1375,6 +1390,25 @@ const converters = {
             const payload1 = converters.checkin_presence.convert(model, msg, publish, options, meta);
             const payload2 = converters.command_on.convert(model, msg, publish, options, meta);
             return {...payload1, ...payload2};
+        },
+    },
+    tuya_temperature_humidity_sensor: {
+        cluster: 'manuSpecificTuya',
+        type: ['commandSetDataResponse', 'commandGetData'],
+        convert: (model, msg, publish, options, meta) => {
+            const dp = msg.data.dp;
+            const value = tuya.getDataValue(msg.data.datatype, msg.data.data);
+            switch (dp) {
+            case 1:
+                return {temperature: calibrateAndPrecisionRoundOptions(value / 10, options, 'temperature')};
+            case 2:
+                return {humidity: calibrateAndPrecisionRoundOptions(value, options, 'humidity')};
+            case 4:
+                return {battery: value};
+            default:
+                meta.logger.warn(`zigbee-herdsman-converters:maa_tuya_temp_sensor: NOT RECOGNIZED ` +
+                    `DP #${dp} with data ${JSON.stringify(msg.data)}`);
+            }
         },
     },
     tuya_thermostat_weekly_schedule: {
@@ -1974,6 +2008,14 @@ const converters = {
                 const backlightLookup = {0: 'LOW', 1: 'MEDIUM', 2: 'HIGH'};
                 return {backlight_mode: backlightLookup[value]};
             }
+        },
+    },
+    WSZ01_on_off_action: {
+        cluster: 65029,
+        type: 'raw',
+        convert: (model, msg, publish, options, meta) => {
+            const clickMapping = {0: 'release', 1: 'single', 2: 'double', 3: 'hold'};
+            return {action: `${clickMapping[msg.data[6]]}`};
         },
     },
     tuya_on_off_action: {
@@ -3505,6 +3547,43 @@ const converters = {
             return {humidity: calibrateAndPrecisionRoundOptions(humidity, options, 'humidity')};
         },
     },
+    frankever_valve: {
+        cluster: 'manuSpecificTuya',
+        type: ['commandGetData', 'commandSetDataResponse', 'commandActiveStatusReport'],
+        convert: (model, msg, publish, options, meta) => {
+            const value = tuya.getDataValue(msg.data.datatype, msg.data.data);
+            const dp = msg.data.dp;
+            switch (dp) {
+            case tuya.dataPoints.state: {
+                return {state: value ? 'ON': 'OFF'};
+            }
+            case tuya.dataPoints.frankEverTreshold: {
+                return {threshold: value};
+            }
+            case tuya.dataPoints.frankEverTimer: {
+                return {timer: value / 60};
+            }
+            default: {
+                meta.logger.warn(`zigbee-herdsman-converters:FrankeverValve: NOT RECOGNIZED DP ` +
+                    `#${dp} with data ${JSON.stringify(msg.data)}`);
+            }
+            }
+        },
+    },
+    tuya_smoke: {
+        cluster: 'manuSpecificTuya',
+        type: ['commandGetData'],
+        convert: (model, msg, publish, options, meta) => {
+            const dp = msg.data.dp;
+            const value = tuya.getDataValue(msg.data.datatype, msg.data.data);
+            switch (dp) {
+            case tuya.dataPoints.state:
+                return {smoke: value === 0 ? true : false};
+            default:
+                meta.logger.warn(`zigbee-herdsman-converters:tuya_smoke: Unrecognized DP #${ dp} with data ${JSON.stringify(msg.data)}`);
+            }
+        },
+    },
     tuya_switch: {
         cluster: 'manuSpecificTuya',
         type: ['commandSetDataResponse', 'commandGetData', 'commandActiveStatusReport'],
@@ -3522,6 +3601,33 @@ const converters = {
             } else if (dp === tuya.dataPoints.state) {
                 return {state: state};
             }
+            return null;
+        },
+    },
+    tuya_dinrail_switch: {
+        cluster: 'manuSpecificTuya',
+        type: ['commandSetDataResponse', 'commandGetData', 'commandActiveStatusReport'],
+        convert: (model, msg, publish, options, meta) => {
+            const dp = msg.data.dp;
+            const value = tuya.getDataValue(msg.data.datatype, msg.data.data);
+            const state = value ? 'ON' : 'OFF';
+
+            switch (dp) {
+            case tuya.dataPoints.state: // DPID that we added to common
+                return {state: state};
+            case tuya.dataPoints.dinrailPowerMeterTotalEnergy:
+                return {energy: value/100};
+            case tuya.dataPoints.dinrailPowerMeterCurrent:
+                return {current: value/1000};
+            case tuya.dataPoints.dinrailPowerMeterPower:
+                return {power: value/10};
+            case tuya.dataPoints.dinrailPowerMeterVoltage:
+                return {voltage: value/10};
+            default:
+                meta.logger.warn(`zigbee-herdsman-converters:TuyaDinRailSwitch: NOT RECOGNIZED DP ` +
+                    `#${dp} with data ${JSON.stringify(msg.data)}`);
+            }
+
             return null;
         },
     },
@@ -3604,7 +3710,9 @@ const converters = {
         cluster: 'genBinaryInput',
         type: ['attributeReport', 'readResponse'],
         convert: (model, msg, publish, options, meta) => {
-            return {action: msg.data.presentValue ? 'stopped' : 'moving', position: 50};
+            return options.no_position_support ?
+                {action: msg.data.presentValue ? 'stopped' : 'moving', position: 50} :
+                {action: msg.data.presentValue ? 'stopped' : 'moving'};
         },
     },
     legrand_scenes: {
@@ -4343,6 +4451,26 @@ const converters = {
                 globalStore.putValue(msg.endpoint, 'button', {button, start: Date.now()});
             }
             return result;
+        },
+    },
+    xiaomi_switch_type: {
+        cluster: 'aqaraOpple',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            if (msg.data.hasOwnProperty(0x000A)) {
+                const lookup = {1: 'toggle', 2: 'momentary'};
+                return {switch_type: lookup[msg.data[0x000A]]};
+            }
+        },
+    },
+    xiaomi_switch_power_outage_memory: {
+        cluster: 'aqaraOpple',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            if (msg.data.hasOwnProperty(0x0201)) {
+                const lookup = [false, true];
+                return {power_outage_memory: lookup[msg.data[0x0201]]};
+            }
         },
     },
     keen_home_smart_vent_pressure: {
@@ -5393,6 +5521,27 @@ const converters = {
                 meta.logger.warn(`zigbee-herdsman-converters:WooxR7060: Unrecognized DP #${
                     dp} with data ${JSON.stringify(msg.data)}`);
             }
+        },
+    },
+    idlock: {
+        cluster: 'closuresDoorLock',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            const result = {};
+            if (0x4000 in msg.data) {
+                result.master_pin_mode = msg.data[0x4000] == 1 ? true : false;
+            }
+            if (0x4001 in msg.data) {
+                result.rfid_enable = msg.data[0x4001] == 1 ? true : false;
+            }
+            if (0x4004 in msg.data) {
+                const lookup = {0: 'auto_off_away_off', 1: 'auto_on_away_off', 2: 'auto_off_away_on', 3: 'auto_on_away_on'};
+                result.lock_mode = lookup[msg.data[0x4004]];
+            }
+            if (0x4005 in msg.data) {
+                result.relock_enabled = msg.data[0x4005] == 1 ? true : false;
+            }
+            return result;
         },
     },
 
